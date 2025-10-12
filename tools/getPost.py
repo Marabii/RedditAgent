@@ -15,13 +15,17 @@ original screenshot helper (`a`, `1`..`9`) are still available.
 
 from __future__ import annotations
 
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+from difflib import SequenceMatcher
 
 import torch
 from PIL import Image
@@ -35,10 +39,14 @@ from mss.base import MSSBase
 # Paths / configuration
 # ---------------------------------------------------------------------------
 REPO_ROOT = Path(__file__).resolve().parents[1]
-OUTPUT_DIR = REPO_ROOT / "temporary"
+TEMPORARY_DIR = REPO_ROOT / "tools" / "temporary"
+OUTPUT_DIR = TEMPORARY_DIR / "posts"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-FAILED_OUTPUT_DIR = OUTPUT_DIR / "failed_attempts"
+FAILED_OUTPUT_DIR = TEMPORARY_DIR / "failed_attempts"
 FAILED_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+SAVE_FAILED_ATTEMPTS = False
+
+LAST_TITLE_PATH = TEMPORARY_DIR / "lastPostTitle.txt"
 
 GROUNDING_ROOT = REPO_ROOT / "GroundingDino"
 GROUNDING_OUTPUT_DIR = GROUNDING_ROOT / "outputs"
@@ -58,21 +66,20 @@ from grounding_dino_runner import (  # type: ignore  # noqa: E402
 # ---------------------------------------------------------------------------
 # Constants and global state
 # ---------------------------------------------------------------------------
-PROMPT = "postCard . upvote . downvote"
+PROMPT = "postCard . upvote . downvote . postTitle"
 LABEL_POST = "postcard"
 LABEL_UPVOTE = "upvote"
 LABEL_DOWNVOTE = "downvote"
+LABEL_POSTITLE = "posttitle"
 
-SCROLL_STEP = -3  # negative scrolls downward (showing content further down)
-SCROLL_DELAY = 0.75  # seconds between scroll attempts
-MAX_SCROLL_ATTEMPTS = 12
+SCROLL_STEP = -2  # negative scrolls downward (showing content further down)
+SCROLL_DELAY = 0.05  # seconds between scroll attempts
+MAX_SCROLL_ATTEMPTS = 50
 POST_MARGIN = 4  # px margin used when checking visibility
-NEW_POST_GAP = 12  # px gap required between previously saved post and next one
 
 current_monitor_index: int = 0  # 0 = virtual desktop (all monitors)
 process_active: bool = False
 stop_requested: bool = False
-last_captured_bottom: int = -NEW_POST_GAP
 capture_thread: Optional[threading.Thread] = None
 mouse_controller = mouse.Controller()
 
@@ -93,6 +100,54 @@ class Detection:
 def timestamped_name(prefix: str = "post", ext: str = "png") -> Path:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     return OUTPUT_DIR / f"{prefix}_{ts}.{ext}"
+
+
+def clean_title(text: str) -> str:
+    return " ".join(text.strip().split())
+
+
+def normalize_title(text: str) -> str:
+    return clean_title(text).casefold()
+
+
+def read_last_post_title() -> str:
+    if not LAST_TITLE_PATH.exists():
+        return ""
+    try:
+        return clean_title(LAST_TITLE_PATH.read_text(encoding="utf-8"))
+    except OSError as err:
+        print(f"[title-cache] failed to read last title: {err}")
+        return ""
+
+
+def write_last_post_title(title: str) -> None:
+    try:
+        LAST_TITLE_PATH.write_text(clean_title(title), encoding="utf-8")
+    except OSError as err:
+        print(f"[title-cache] failed to write last title: {err}")
+
+
+def extract_title_text(image: Image.Image, box: Tuple[int, int, int, int]) -> str:
+    crop = image.crop(box)
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_file:
+        tmp_path = Path(tmp_file.name)
+        crop.save(tmp_path, format="PNG", optimize=False)
+
+    try:
+        result = subprocess.run(
+            ["tesseract", str(tmp_path), "stdout"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        text = result.stdout
+    except (FileNotFoundError, subprocess.CalledProcessError) as err:
+        print(f"[ocr] failed to read post title: {err}")
+        text = ""
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    return clean_title(text)
 
 
 def describe_monitors(monitors: Sequence[dict]) -> str:
@@ -198,6 +253,20 @@ def gather_detections(
     return detections
 
 
+def find_title_in_post(
+    post: Detection, detections: Iterable[Detection]
+) -> Optional[Detection]:
+    titles = [d for d in detections if d.label == LABEL_POSTITLE]
+    titles_in_post = [d for d in titles if box_contains(post.box, d.box)]
+    if len(titles_in_post) != 1:
+        if SAVE_FAILED_ATTEMPTS and titles_in_post:
+            print(
+                f"post @ y={post.box[1]}..{post.box[3]} has {len(titles_in_post)} title detections; expected exactly 1."
+            )
+        return None
+    return titles_in_post[0]
+
+
 def box_contains(
     outer: Tuple[int, int, int, int], inner: Tuple[int, int, int, int]
 ) -> bool:
@@ -219,7 +288,6 @@ def select_next_post(
     detections: Iterable[Detection],
     *,
     image_height: int,
-    min_top: int,
 ) -> Optional[Detection]:
     posts = [d for d in detections if d.label == LABEL_POST]
     if not posts:
@@ -231,16 +299,29 @@ def select_next_post(
     posts.sort(key=lambda d: d.box[1])  # top-most first
 
     for post in posts:
-        if post.box[1] <= min_top:
-            continue
         if not post_fully_visible(post.box, image_height):
+            if SAVE_FAILED_ATTEMPTS:
+                print(
+                    f"skip post @ y={post.box[1]}..{post.box[3]} because not fully visible."
+                )
             continue
 
-        up_inside = any(box_contains(post.box, up.box) for up in upvotes)
-        down_inside = any(box_contains(post.box, down.box) for down in downvotes)
+        ups_in_post = [up for up in upvotes if box_contains(post.box, up.box)]
+        downs_in_post = [dn for dn in downvotes if box_contains(post.box, dn.box)]
 
-        if up_inside and down_inside:
-            return post
+        if SAVE_FAILED_ATTEMPTS:
+            print(
+                f"post @ y={post.box[1]}..{post.box[3]} has {len(ups_in_post)} upvote(s) and {len(downs_in_post)} downvote(s)."
+            )
+
+        if len(ups_in_post) != 1 or len(downs_in_post) != 1:
+            continue
+
+        title_detection = find_title_in_post(post, detections)
+        if not title_detection:
+            continue
+
+        return post
 
     return None
 
@@ -256,12 +337,10 @@ def run_grounding(image_path: Path) -> Dict[str, Sequence]:
 # ---------------------------------------------------------------------------
 # Core capture logic
 # ---------------------------------------------------------------------------
-def capture_and_save_post(*, reset_position: bool = False) -> bool:
-    global last_captured_bottom, stop_requested
+def capture_and_save_post() -> bool:
+    global stop_requested
 
-    if reset_position:
-        last_captured_bottom = -NEW_POST_GAP
-
+    last_title = read_last_post_title()
     for attempt in range(1, MAX_SCROLL_ATTEMPTS + 1):
         if stop_requested:
             print("Capture interrupted.")
@@ -281,38 +360,63 @@ def capture_and_save_post(*, reset_position: bool = False) -> bool:
             return False
 
         detections = gather_detections(image, inference)
-        candidate = select_next_post(
-            detections,
-            image_height=image.size[1],
-            min_top=last_captured_bottom + NEW_POST_GAP,
-        )
+        candidate = select_next_post(detections, image_height=image.size[1])
 
         if candidate:
+            title_detection = find_title_in_post(candidate, detections)
+            title_text = ""
+            if title_detection:
+                title_text = extract_title_text(image, title_detection.box)
+            else:
+                print("[ocr] no postTitle detection inside the selected post.")
+
+            normalized_title = normalize_title(title_text)
+            normalized_last = normalize_title(last_title)
+            if normalized_title and normalized_last:
+                similarity = SequenceMatcher(
+                    None, normalized_title, normalized_last
+                ).ratio()
+                print(f"Title similarity: {similarity:.3f}")
+                if similarity >= 0.9:
+                    screenshot_path.unlink(missing_ok=True)
+                    mouse_controller.scroll(0, SCROLL_STEP)
+                    time.sleep(SCROLL_DELAY)
+                    print(
+                        "Detected previously captured post. Scrolling to search again…"
+                    )
+                    continue
+
             crop = image.crop(candidate.box)
             out_path = timestamped_name(prefix="post")
             crop.save(out_path, format="PNG", optimize=False)
-            last_captured_bottom = candidate.box[3]
-
             print(
                 f"Saved post @ y={candidate.box[1]}..{candidate.box[3]} to {out_path.name}"
             )
+
+            if title_text:
+                write_last_post_title(title_text)
+                last_title = title_text
+            else:
+                write_last_post_title("")
+                last_title = ""
 
             screenshot_path.unlink(missing_ok=True)
             return True
 
         # No candidate — clean up and scroll for another attempt.
-        try:
-            crop_or_draw(
-                image_path=str(screenshot_path),
-                tgt=inference,
-                mode="draw",
-                output_dir=FAILED_OUTPUT_DIR,
-            )
-            print(
-                f"Attempt {attempt}: saved debug annotation to {FAILED_OUTPUT_DIR.name}."
-            )
-        except Exception as dbg_err:
-            print(f"[debug] failed to save annotation: {dbg_err}")
+        if SAVE_FAILED_ATTEMPTS:
+            try:
+                crop_or_draw(
+                    image_path=str(screenshot_path),
+                    tgt=inference,
+                    mode="draw",
+                    output_dir=FAILED_OUTPUT_DIR,
+                )
+                print(
+                    f"Attempt {attempt}: saved debug annotation to {FAILED_OUTPUT_DIR.name}."
+                )
+            except Exception as dbg_err:
+                print(f"[debug] failed to save annotation: {dbg_err}")
 
         screenshot_path.unlink(missing_ok=True)
         if stop_requested:
@@ -328,15 +432,15 @@ def capture_and_save_post(*, reset_position: bool = False) -> bool:
     return False
 
 
-def _capture_worker(reset_position: bool) -> None:
+def _capture_worker() -> None:
     global capture_thread
     try:
-        capture_and_save_post(reset_position=reset_position)
+        capture_and_save_post()
     finally:
         capture_thread = None
 
 
-def launch_capture(reset_position: bool) -> None:
+def launch_capture() -> None:
     global capture_thread
 
     if capture_thread and capture_thread.is_alive():
@@ -345,7 +449,6 @@ def launch_capture(reset_position: bool) -> None:
 
     thread = threading.Thread(
         target=_capture_worker,
-        args=(reset_position,),
         name="post_capture",
         daemon=True,
     )
@@ -367,7 +470,7 @@ def on_press(key):
                 stop_requested = False
                 process_active = True
                 print("Starting capture loop…")
-                launch_capture(reset_position=True)
+                launch_capture()
                 return
 
             if c == "n":
@@ -375,7 +478,7 @@ def on_press(key):
                     print("Press 's' first to start the capture loop.")
                     return
                 stop_requested = False
-                launch_capture(reset_position=False)
+                launch_capture()
                 return
 
             if c == "q":
