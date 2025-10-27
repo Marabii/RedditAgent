@@ -2,7 +2,7 @@ from grounding_dino_runner import run_grounding_dino, crop_or_draw
 
 res = run_grounding_dino(
     image_path="/home/hamza/Pictures/reddit.png",
-    text_prompt="postCard . upvote . downvote . adPost . postTitle",
+    text_prompt="postCard . postTitle",
     output_dir="../outputs",
     # (optional overrides)
     # config_file="config/cfg_odvg.py",
@@ -12,10 +12,10 @@ res = run_grounding_dino(
     # cpu_only=True,
 )
 
-# crop_or_draw(image_path="/home/hamza/Pictures/reddit.png", tgt=res, mode="draw")
+crop_or_draw(image_path="/home/hamza/Pictures/reddit.png", tgt=res, mode="draw")
 
-crops = crop_or_draw(image_path="/home/hamza/Pictures/reddit.png", tgt=res, mode="crop")
-for i, (crop_img, label, box) in enumerate(crops):  # type: ignore
-    crop_img.save("../outputs" + "_crop_{i:02d}.jpg")
+# crops = crop_or_draw(image_path="/home/hamza/Pictures/reddit.png", tgt=res, mode="crop")
+# for i, (crop_img, label, box) in enumerate(crops):  # type: ignore
+#     crop_img.save("../outputs" + "_crop_{i:02d}.jpg")
 
 print(res)

@@ -1,3 +1,4 @@
 temporary
 tools/__pycache__
 tools/node_modules
+tools/.env

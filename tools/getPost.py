@@ -1,24 +1,17 @@
 #!/usr/bin/env python3
-"""Capture Reddit posts via GroundingDINO when hotkeys are pressed.
+"""Capture Reddit posts via GroundingDINO without relying on hotkeys.
 
-Workflow
---------
-1. Press `s` to start the capture loop. The current fully-visible post (if any)
-   is located, cropped, and saved into the `temporary/` directory.
-2. Press `n` to advance to the next post. The script scrolls as needed until it
-   finds the next fully-visible post that also contains both the upvote and
-   downvote buttons inside the detected `postCard` region.
-
-Press `q` or `Esc` at any time to quit. Monitor-selection hotkeys from the
-original screenshot helper (`a`, `1`..`9`) are still available.
+Callers can invoke the public `capture_next_post` function to locate the next
+fully-visible post on screen, crop it, and persist both the image and metadata
+for downstream automation.
 """
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -29,7 +22,6 @@ from difflib import SequenceMatcher
 
 import torch
 from PIL import Image
-from pynput import keyboard  # type: ignore
 from pynput import mouse
 import mss
 from mss.base import MSSBase
@@ -46,7 +38,8 @@ FAILED_OUTPUT_DIR = TEMPORARY_DIR / "failed_attempts"
 FAILED_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 SAVE_FAILED_ATTEMPTS = False
 
-LAST_TITLE_PATH = TEMPORARY_DIR / "lastPostTitle.txt"
+LAST_POST_INFO_PATH = TEMPORARY_DIR / "lastPostInfo.json"
+RECENT_TITLES_PATH = TEMPORARY_DIR / "recentTitles.json"
 
 GROUNDING_ROOT = REPO_ROOT / "GroundingDino"
 GROUNDING_OUTPUT_DIR = GROUNDING_ROOT / "outputs"
@@ -66,21 +59,17 @@ from grounding_dino_runner import (  # type: ignore  # noqa: E402
 # ---------------------------------------------------------------------------
 # Constants and global state
 # ---------------------------------------------------------------------------
-PROMPT = "postCard . upvote . downvote . postTitle"
+PROMPT = "postCard . upvote . downvote . comment . postTitle"
 LABEL_POST = "postcard"
 LABEL_UPVOTE = "upvote"
 LABEL_DOWNVOTE = "downvote"
+LABEL_COMMENT = "comment"
 LABEL_POSTITLE = "posttitle"
 
 SCROLL_STEP = -2  # negative scrolls downward (showing content further down)
 SCROLL_DELAY = 0.05  # seconds between scroll attempts
-MAX_SCROLL_ATTEMPTS = 50
 POST_MARGIN = 4  # px margin used when checking visibility
 
-current_monitor_index: int = 0  # 0 = virtual desktop (all monitors)
-process_active: bool = False
-stop_requested: bool = False
-capture_thread: Optional[threading.Thread] = None
 mouse_controller = mouse.Controller()
 
 
@@ -92,6 +81,20 @@ class Detection:
     label: str
     box: Tuple[int, int, int, int]  # x0, y0, x1, y1 in pixel space
     score: Optional[float]
+
+
+@dataclass
+class PostSelection:
+    post: Detection
+    upvote: Detection
+    downvote: Detection
+    comment: Detection
+
+
+@dataclass
+class PostSelectionWithTitle:
+    selection: PostSelection
+    title_text: str
 
 
 # ---------------------------------------------------------------------------
@@ -110,21 +113,94 @@ def normalize_title(text: str) -> str:
     return clean_title(text).casefold()
 
 
-def read_last_post_title() -> str:
-    if not LAST_TITLE_PATH.exists():
-        return ""
+def read_last_post_info() -> Tuple[str, Optional[Tuple[int, int, int, int]]]:
+    if not LAST_POST_INFO_PATH.exists():
+        return "", None
     try:
-        return clean_title(LAST_TITLE_PATH.read_text(encoding="utf-8"))
-    except OSError as err:
-        print(f"[title-cache] failed to read last title: {err}")
-        return ""
+        data = json.loads(LAST_POST_INFO_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as err:
+        print(f"[post-cache] failed to read last post info: {err}")
+        return "", None
+
+    title = clean_title(str(data.get("title", "")))
+    bbox = _bbox_from_data(data.get("bbox"))
+
+    return title, bbox
 
 
-def write_last_post_title(title: str) -> None:
+def read_recent_titles(max_titles: int = 3) -> List[str]:
+    if not RECENT_TITLES_PATH.exists():
+        return []
     try:
-        LAST_TITLE_PATH.write_text(clean_title(title), encoding="utf-8")
+        data = json.loads(RECENT_TITLES_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+
+    if not isinstance(data, list):
+        return []
+
+    titles: List[str] = []
+    for entry in data:
+        if isinstance(entry, str) and entry.strip():
+            titles.append(clean_title(entry))
+        if len(titles) >= max_titles:
+            break
+    return titles
+
+
+def push_recent_title(title: str, max_titles: int = 3) -> None:
+    title = clean_title(title)
+    if not title:
+        return
+    titles = read_recent_titles(max_titles=max_titles)
+    existing = [t for t in titles if t.lower() != title.lower()]
+    updated = [title] + existing
+    trimmed = updated[:max_titles]
+    try:
+        RECENT_TITLES_PATH.write_text(
+            json.dumps(trimmed, ensure_ascii=True, indent=2), encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
+def _bbox_to_list(bbox: Optional[Tuple[int, int, int, int]]) -> Optional[List[int]]:
+    if not bbox:
+        return None
+    return [int(v) for v in bbox]
+
+
+def _bbox_from_data(
+    raw: object,
+) -> Optional[Tuple[int, int, int, int]]:
+    if not isinstance(raw, (list, tuple)) or len(raw) != 4:
+        return None
+    if not all(isinstance(v, (int, float)) for v in raw):
+        return None
+    return tuple(int(v) for v in raw)  # type: ignore[return-value]
+
+
+def write_last_post_info(
+    title: str,
+    bbox: Optional[Tuple[int, int, int, int]],
+    *,
+    upvote_bbox: Optional[Tuple[int, int, int, int]] = None,
+    downvote_bbox: Optional[Tuple[int, int, int, int]] = None,
+    comment_bbox: Optional[Tuple[int, int, int, int]] = None,
+) -> None:
+    payload = {
+        "title": clean_title(title),
+        "bbox": _bbox_to_list(bbox),
+        "upvote_bbox": _bbox_to_list(upvote_bbox),
+        "downvote_bbox": _bbox_to_list(downvote_bbox),
+        "comment_bbox": _bbox_to_list(comment_bbox),
+    }
+    try:
+        LAST_POST_INFO_PATH.write_text(
+            json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8"
+        )
     except OSError as err:
-        print(f"[title-cache] failed to write last title: {err}")
+        print(f"[post-cache] failed to write last post info: {err}")
 
 
 def extract_title_text(image: Image.Image, box: Tuple[int, int, int, int]) -> str:
@@ -150,30 +226,18 @@ def extract_title_text(image: Image.Image, box: Tuple[int, int, int, int]) -> st
     return clean_title(text)
 
 
-def describe_monitors(monitors: Sequence[dict]) -> str:
-    lines = ["Detected monitors:"]
-    for i, mon in enumerate(monitors):
-        tag = "ALL" if i == 0 else f"{i}"
-        lines.append(
-            f"  {tag}: {mon['width']}x{mon['height']} at ({mon['left']},{mon['top']})"
-        )
-    return "\n".join(lines)
-
-
 def grab_as_pil(sct: MSSBase, monitor_box: dict) -> Image.Image:
     shot = sct.grab(monitor_box)
     return Image.frombytes("RGB", shot.size, shot.rgb)
 
 
-def capture_monitor_image() -> Tuple[Image.Image, Path]:
-    """Capture the currently selected monitor and persist it as PNG."""
-    global current_monitor_index
-
+def capture_monitor_image(monitor_index: int = 0) -> Tuple[Image.Image, Path]:
+    """Capture the requested monitor and persist it as PNG."""
     out_path = timestamped_name(prefix="screen")
 
     with mss.mss() as sct:
         monitors = sct.monitors
-        idx = current_monitor_index
+        idx = monitor_index
         if idx < 0 or idx >= len(monitors):
             print(
                 f"[warn] Monitor index {idx} invalid. Falling back to ALL (0).",
@@ -185,21 +249,6 @@ def capture_monitor_image() -> Tuple[Image.Image, Path]:
         img.save(out_path, format="PNG", optimize=False)
 
     return img, out_path
-
-
-def print_help(monitors: Sequence[dict]) -> None:
-    print(
-        "\nHotkeys:\n"
-        "  • s : start capture loop (grab first visible post)\n"
-        "  • n : capture next visible post\n"
-        "  • a : capture ALL monitors (virtual desktop)\n"
-        "  • 1..9 : choose specific monitor\n"
-        "  • q or Esc : quit\n"
-    )
-    print(describe_monitors(monitors))
-    print(
-        f"\nCurrent target: {'ALL' if current_monitor_index == 0 else current_monitor_index}\n"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -287,16 +336,21 @@ def post_fully_visible(post_box: Tuple[int, int, int, int], height: int) -> bool
 def select_next_post(
     detections: Iterable[Detection],
     *,
+    image: Image.Image,
     image_height: int,
-) -> Optional[Detection]:
+    recent_titles: Sequence[str],
+) -> Optional[PostSelectionWithTitle]:
     posts = [d for d in detections if d.label == LABEL_POST]
     if not posts:
         return None
 
     upvotes = [d for d in detections if d.label == LABEL_UPVOTE]
     downvotes = [d for d in detections if d.label == LABEL_DOWNVOTE]
+    comments = [d for d in detections if d.label == LABEL_COMMENT]
 
     posts.sort(key=lambda d: d.box[1])  # top-most first
+
+    normalized_recent = [normalize_title(title) for title in recent_titles if title]
 
     for post in posts:
         if not post_fully_visible(post.box, image_height):
@@ -308,20 +362,61 @@ def select_next_post(
 
         ups_in_post = [up for up in upvotes if box_contains(post.box, up.box)]
         downs_in_post = [dn for dn in downvotes if box_contains(post.box, dn.box)]
+        comments_in_post = [cm for cm in comments if box_contains(post.box, cm.box)]
 
         if SAVE_FAILED_ATTEMPTS:
             print(
-                f"post @ y={post.box[1]}..{post.box[3]} has {len(ups_in_post)} upvote(s) and {len(downs_in_post)} downvote(s)."
+                (
+                    f"post @ y={post.box[1]}..{post.box[3]} has "
+                    f"{len(ups_in_post)} upvote(s), {len(downs_in_post)} downvote(s), "
+                    f"and {len(comments_in_post)} comment button(s)."
+                )
             )
 
-        if len(ups_in_post) != 1 or len(downs_in_post) != 1:
+        if (
+            len(ups_in_post) != 1
+            or len(downs_in_post) != 1
+            or len(comments_in_post) != 1
+        ):
             continue
 
         title_detection = find_title_in_post(post, detections)
         if not title_detection:
             continue
 
-        return post
+        title_text = extract_title_text(image, title_detection.box)
+        if not title_text.strip():
+            if SAVE_FAILED_ATTEMPTS:
+                print("Skipping post because extracted title was empty")
+            continue
+        normalized_title = normalize_title(title_text)
+
+        duplicate_found = False
+        if normalized_title:
+            for candidate in normalized_recent:
+                if not candidate:
+                    continue
+                similarity = SequenceMatcher(None, normalized_title, candidate).ratio()
+                print(f"Title similarity vs recent: {similarity:.3f}")
+                if similarity >= 0.9:
+                    duplicate_found = True
+                    break
+        if duplicate_found:
+            if SAVE_FAILED_ATTEMPTS:
+                print(
+                    "Detected recently captured post; searching for another title."
+                )
+            continue
+
+        return PostSelectionWithTitle(
+            selection=PostSelection(
+                post=post,
+                upvote=ups_in_post[0],
+                downvote=downs_in_post[0],
+                comment=comments_in_post[0],
+            ),
+            title_text=title_text,
+        )
 
     return None
 
@@ -337,71 +432,64 @@ def run_grounding(image_path: Path) -> Dict[str, Sequence]:
 # ---------------------------------------------------------------------------
 # Core capture logic
 # ---------------------------------------------------------------------------
-def capture_and_save_post() -> bool:
-    global stop_requested
-
-    last_title = read_last_post_title()
-    for attempt in range(1, MAX_SCROLL_ATTEMPTS + 1):
-        if stop_requested:
-            print("Capture interrupted.")
-            return False
-        image, screenshot_path = capture_monitor_image()
+def capture_next_post(
+    monitor_index: int = 0,
+) -> Optional[Dict[str, object]]:
+    last_title, _ = read_last_post_info()
+    recent_titles = read_recent_titles()
+    if last_title:
+        recent_titles = [clean_title(last_title)] + [t for t in recent_titles if clean_title(last_title).lower() != t.lower()]
+        recent_titles = recent_titles[:3]
+    attempt = 1
+    while True:
+        image, screenshot_path = capture_monitor_image(monitor_index)
 
         try:
             inference = run_grounding(screenshot_path)
         except Exception as err:  # pragma: no cover - provides user feedback
             print(f"[grounding] failed: {err}")
             screenshot_path.unlink(missing_ok=True)
-            return False
-
-        if stop_requested:
-            screenshot_path.unlink(missing_ok=True)
-            print("Capture interrupted.")
-            return False
+            return None
 
         detections = gather_detections(image, inference)
-        candidate = select_next_post(detections, image_height=image.size[1])
+        selection_with_title = select_next_post(
+            detections,
+            image=image,
+            image_height=image.size[1],
+            recent_titles=recent_titles,
+        )
 
-        if candidate:
-            title_detection = find_title_in_post(candidate, detections)
-            title_text = ""
-            if title_detection:
-                title_text = extract_title_text(image, title_detection.box)
-            else:
-                print("[ocr] no postTitle detection inside the selected post.")
+        if selection_with_title:
+            selection = selection_with_title.selection
+            title_text = selection_with_title.title_text
 
-            normalized_title = normalize_title(title_text)
-            normalized_last = normalize_title(last_title)
-            if normalized_title and normalized_last:
-                similarity = SequenceMatcher(
-                    None, normalized_title, normalized_last
-                ).ratio()
-                print(f"Title similarity: {similarity:.3f}")
-                if similarity >= 0.9:
-                    screenshot_path.unlink(missing_ok=True)
-                    mouse_controller.scroll(0, SCROLL_STEP)
-                    time.sleep(SCROLL_DELAY)
-                    print(
-                        "Detected previously captured post. Scrolling to search again…"
-                    )
-                    continue
-
-            crop = image.crop(candidate.box)
+            crop = image.crop(selection.post.box)
             out_path = timestamped_name(prefix="post")
             crop.save(out_path, format="PNG", optimize=False)
             print(
-                f"Saved post @ y={candidate.box[1]}..{candidate.box[3]} to {out_path.name}"
+                f"Saved post @ y={selection.post.box[1]}..{selection.post.box[3]} to {out_path.name}"
             )
 
-            if title_text:
-                write_last_post_title(title_text)
-                last_title = title_text
-            else:
-                write_last_post_title("")
-                last_title = ""
+            write_last_post_info(
+                title_text,
+                selection.post.box,
+                upvote_bbox=selection.upvote.box,
+                downvote_bbox=selection.downvote.box,
+                comment_bbox=selection.comment.box,
+            )
+            last_title = title_text
+            push_recent_title(title_text)
+            recent_titles = read_recent_titles()
 
             screenshot_path.unlink(missing_ok=True)
-            return True
+            return {
+                "image_path": out_path,
+                "title": title_text,
+                "bbox": selection.post.box,
+                "upvote_bbox": selection.upvote.box,
+                "downvote_bbox": selection.downvote.box,
+                "comment_bbox": selection.comment.box,
+            }
 
         # No candidate — clean up and scroll for another attempt.
         if SAVE_FAILED_ATTEMPTS:
@@ -419,124 +507,26 @@ def capture_and_save_post() -> bool:
                 print(f"[debug] failed to save annotation: {dbg_err}")
 
         screenshot_path.unlink(missing_ok=True)
-        if stop_requested:
-            print("Capture interrupted.")
-            return False
         mouse_controller.scroll(0, SCROLL_STEP)
+        print("------- scrolling----------")
         print(
             f"Attempt {attempt}: no fully visible post. Scrolling and retrying in {SCROLL_DELAY}s…"
         )
-        time.sleep(SCROLL_DELAY)
-
-    print("Exhausted scroll attempts without finding a valid post.")
-    return False
-
-
-def _capture_worker() -> None:
-    global capture_thread
-    try:
-        capture_and_save_post()
-    finally:
-        capture_thread = None
-
-
-def launch_capture() -> None:
-    global capture_thread
-
-    if capture_thread and capture_thread.is_alive():
-        print("Capture already in progress; wait for it to finish.")
-        return
-
-    thread = threading.Thread(
-        target=_capture_worker,
-        name="post_capture",
-        daemon=True,
-    )
-    capture_thread = thread
-    thread.start()
-
-
-# ---------------------------------------------------------------------------
-# Hotkey handling
-# ---------------------------------------------------------------------------
-def on_press(key):
-    global current_monitor_index, process_active, stop_requested
-
-    try:
-        if key.char:
-            c = key.char.lower()
-
-            if c == "s":
-                stop_requested = False
-                process_active = True
-                print("Starting capture loop…")
-                launch_capture()
-                return
-
-            if c == "n":
-                if not process_active:
-                    print("Press 's' first to start the capture loop.")
-                    return
-                stop_requested = False
-                launch_capture()
-                return
-
-            if c == "q":
-                print("Quitting…")
-                stop_requested = True
-                return None
-
-            if c == "a":
-                current_monitor_index = 0
-                with mss.mss() as sct:
-                    mon = sct.monitors[0]
-                    print(f"Switched to ALL monitors ({mon['width']}x{mon['height']}).")
-                return
-
-            if c.isdigit() and c != "0":
-                new_idx = int(c)
-                with mss.mss() as sct:
-                    if new_idx < len(sct.monitors):
-                        current_monitor_index = new_idx
-                        mon = sct.monitors[new_idx]
-                        process_active = False
-                        stop_requested = False
-                        print(
-                            f"Switched to monitor {new_idx}: {mon['width']}x{mon['height']}"
-                            f" at ({mon['left']},{mon['top']}). Capture loop paused."
-                        )
-                    else:
-                        print(
-                            f"No monitor {new_idx}. Available: 1..{len(sct.monitors) - 1} or 'a'."
-                        )
-                return
-
-    except AttributeError:
-        pass
-
-    if key == keyboard.Key.esc:
-        stop_requested = True
-        print("Quitting…")
-        return None
+        attempt += 1
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 def main() -> None:
-    global stop_requested
-    with mss.mss() as sct:
+    result = capture_next_post()
+    if result:
         print(
-            "Ready. Press 's' to start capturing posts, 'n' for the next one, 'q' to quit."
+            f"Captured post image saved to {result['image_path']} with title '{result['title']}'."
         )
-        print_help(sct.monitors)
-
-    with keyboard.Listener(on_press=on_press) as listener:
-        listener.join()
-
-    if capture_thread and capture_thread.is_alive():
-        stop_requested = True
-        capture_thread.join()
+        mouse_controller.scroll(0, -SCROLL_STEP)
+    else:
+        print("No valid post captured.")
 
 
 if __name__ == "__main__":
