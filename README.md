@@ -4,6 +4,11 @@ An automation pipeline that navigates Reddit, discovers valuable posts, reasons 
 
 This project was built to demonstrate full-stack applied ML engineering—data collection, model finetuning, tool wiring, and autonomous agent design.
 
+
+
+https://github.com/user-attachments/assets/946ff453-f589-450b-8f2e-5be00b19e7df
+
+
 ---
 
 ## ✨ Highlights
