@@ -7,7 +7,6 @@ import json
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Tuple
-import time
 from pynput import mouse
 
 
@@ -76,11 +75,3 @@ def comment_on_post() -> None:
     info = _load_last_post_info()
     bbox = _ensure_bbox(info, "comment_bbox")
     _move_and_click(_box_center(bbox))
-
-
-if __name__ == "__main__":
-    print("Waiting 2 seconds before executing...")
-    time.sleep(2)
-    info = _load_last_post_info()
-    bbox = _ensure_bbox(info, "comment_bbox")
-    mouse_controller.position = _box_center(bbox)

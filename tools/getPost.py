@@ -403,9 +403,7 @@ def select_next_post(
                     break
         if duplicate_found:
             if SAVE_FAILED_ATTEMPTS:
-                print(
-                    "Detected recently captured post; searching for another title."
-                )
+                print("Detected recently captured post; searching for another title.")
             continue
 
         return PostSelectionWithTitle(
@@ -438,7 +436,10 @@ def capture_next_post(
     last_title, _ = read_last_post_info()
     recent_titles = read_recent_titles()
     if last_title:
-        recent_titles = [clean_title(last_title)] + [t for t in recent_titles if clean_title(last_title).lower() != t.lower()]
+        normalized_last = clean_title(last_title)
+        recent_titles = [normalized_last] + [
+            t for t in recent_titles if t.lower() != normalized_last.lower()
+        ]
         recent_titles = recent_titles[:3]
     attempt = 1
     while True:
@@ -482,7 +483,7 @@ def capture_next_post(
             recent_titles = read_recent_titles()
 
             screenshot_path.unlink(missing_ok=True)
-            return {
+            result = {
                 "image_path": out_path,
                 "title": title_text,
                 "bbox": selection.post.box,
@@ -490,6 +491,7 @@ def capture_next_post(
                 "downvote_bbox": selection.downvote.box,
                 "comment_bbox": selection.comment.box,
             }
+            break
 
         # No candidate — clean up and scroll for another attempt.
         if SAVE_FAILED_ATTEMPTS:
@@ -512,7 +514,11 @@ def capture_next_post(
         print(
             f"Attempt {attempt}: no fully visible post. Scrolling and retrying in {SCROLL_DELAY}s…"
         )
-        attempt += 1
+        time.sleep(SCROLL_DELAY)
+
+    if result is not None:
+        mouse_controller.scroll(0, -SCROLL_STEP)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -524,7 +530,6 @@ def main() -> None:
         print(
             f"Captured post image saved to {result['image_path']} with title '{result['title']}'."
         )
-        mouse_controller.scroll(0, -SCROLL_STEP)
     else:
         print("No valid post captured.")
 

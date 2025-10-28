@@ -131,9 +131,9 @@ class KillSwitch:
 
 @dataclass
 class ContinueWaiter:
-    """Pause execution until the user presses the 'c' key to continue."""
+    """Pause execution until the user presses the 'r' key to resume."""
 
-    hotkey: str = "c"
+    hotkey: str = "r"
 
     def __post_init__(self) -> None:
         self._event = threading.Event()
@@ -529,7 +529,7 @@ def build_agent_graph(
             return state
 
         logger.info(
-            "Comment pasted; press 'c' after submitting or cancelling to continue"
+            "Comment pasted; press 'r' after submitting or cancelling to resume"
         )
         proceeded = continue_waiter.wait(kill_switch)
         if not proceeded:

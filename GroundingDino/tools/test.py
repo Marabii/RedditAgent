@@ -2,7 +2,7 @@ from grounding_dino_runner import run_grounding_dino, crop_or_draw
 
 res = run_grounding_dino(
     image_path="/home/hamza/Pictures/reddit.png",
-    text_prompt="postCard . postTitle",
+    text_prompt="postCard . upvote . downvote . comment . postTitle",
     output_dir="../outputs",
     # (optional overrides)
     # config_file="config/cfg_odvg.py",
